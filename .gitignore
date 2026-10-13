@@ -1,0 +1,5 @@
+data/kline/
+data/raw/
+outputs/
+__pycache__/
+data/fetch_failures.txt
