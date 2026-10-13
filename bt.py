@@ -63,7 +63,8 @@ def trading_calendar():
 
 def load_amv_signals(start, end, buy_th, sell_th):
     """保守修复版信号：只用标签恰为真实交易日的行；
-    2日/3日和要求交易日历相邻，否则该分量作废（不参与取max）。"""
+    2日和要求交易日历相邻，否则该分量作废（不参与取max）。
+    标准买入窗口 = 1-2日累加>阈值（2026-10-13 起，1-3日窗口被证伪弃用）。"""
     cal = trading_calendar()
     cal_pos = {d: i for i, d in enumerate(cal)}
     amv = pd.read_csv(os.path.join(HERE, "0amv_day.csv"))
@@ -84,7 +85,7 @@ def load_amv_signals(start, end, buy_th, sell_th):
         if pd.isna(r) or d < pd.Timestamp(start) or d > pd.Timestamp(end):
             continue
         comps = [r]
-        for k in (1, 2):
+        for k in (1,):
             if (i - k >= 0
                     and cal_pos[d] - cal_pos[rows[i - k][0]] == k
                     and not pd.isna(rows[i - k][1])):

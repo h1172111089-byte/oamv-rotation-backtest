@@ -70,7 +70,7 @@ def append_amv(close, chg):
     if today not in cal:
         print(f"警告: 今天 {today} 不是交易日，未写入"); return
     df = pd.read_csv(path)
-    stamp = f"{today}T16:00:00Z"
+    stamp = f"{today}T00:00:00+08:00"
     if stamp in df["date"].tolist():
         print("今日 0AMV 已存在，跳过"); return
     with open(path, "a", encoding="utf-8") as f:
