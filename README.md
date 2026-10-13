@@ -38,11 +38,17 @@
 
 ```powershell
 python fetch_universe_v2.py      # 补全/增量宇宙数据
+python update_daily.py           # 每日增量更新（收盘后）
 python bt.py                     # 基线回测（输出 outputs/）
 python bt.py --exec-price open --cost 0.0015   # 变体
 python run_experiments.py        # 优化实验矩阵
 python defense_overlay.py        # 防守腿熔断检验
 ```
+
+## 跨设备同步
+
+本目录是 git 仓库（GitHub 私有库 `amv-rotation-backtest`），
+行情数据不入库、各机自重建。详见 `同步指南.md`。
 
 ## 待办
 
