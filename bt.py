@@ -5,14 +5,13 @@
 与原始策略文档（B腿 V2-P1）的关系：
   - 漏斗七层规则忠实复刻（资格/趋势/RS/去重/空主线/接力/分散）
   - 进攻池从"手工44只"改为"全市场行业主题ETF宇宙"（build_universe.py 产物）
-  - 信号源可插拔：当前为 0amv_day.csv 保守修复版（见 signals_from_amv），
-    待用户手抄台账到位后以 ledger 替换，一行切换
+  - 信号源可插拔：默认保持历史台账；机械研究显式使用重整理的0amv_day.csv
 
 口径：T日收盘出信号，T+1 成交（默认收盘，可切开盘），单边成本默认 0.1%。
 
 已知局限（输出中会再次声明）：
-  1. 宇宙为当前在册 ETF，已清盘者缺失（轻度幸存者偏差）
-  2. AMV 日期轴损坏，修复版信号为**暂定口径**，台账对账前绝对收益不可尽信
+  1. 宇宙为当前在册 ETF，历史成分和清盘者不完整，幸存者偏差程度未知
+  2. 部分行情缺口与前复权公司行动尚未核验；缺价默认报错
 """
 
 from __future__ import annotations
@@ -24,6 +23,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+from accounting import equity_stats, portfolio_value, rebalance
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -39,9 +39,10 @@ CASH_ASSET = "sh511880"       # 货币ETF（防守熔断用）
 LEDGER = os.path.join(HERE, "0AMV活跃市值切换信号登记表.csv")
 
 
-def load_ledger_signals(start, end):
+def load_ledger_signals(start, end, input_root=None):
     """手抄台账信号（权威源）。结构已校验：交易日/严格交替/执行日=次一交易日。"""
-    led = pd.read_csv(LEDGER).dropna(subset=["信号日期"])
+    path = LEDGER if input_root is None else os.path.join(input_root, os.path.basename(LEDGER))
+    led = pd.read_csv(path).dropna(subset=["信号日期"])
     led["date"] = pd.to_datetime(led["信号日期"])
     led = led[(led["date"] >= pd.Timestamp(start)) & (led["date"] <= pd.Timestamp(end))]
     sig = pd.DataFrame({"buy": led["方向"] == "买入",
@@ -51,8 +52,9 @@ def load_ledger_signals(start, end):
 
 # ---------------------------------------------------------------- 数据层
 
-def load_kline(code):
-    df = pd.read_csv(os.path.join(KLINE, f"{code}.csv"))
+def load_kline(code, input_root=None):
+    directory = KLINE if input_root is None else os.path.join(input_root, "data", "kline")
+    df = pd.read_csv(os.path.join(directory, f"{code}.csv"))
     df["date"] = pd.to_datetime(df["date"])
     return df.set_index("date").sort_index()
 
@@ -61,21 +63,22 @@ def trading_calendar():
     return load_kline("sh000001").index
 
 
-def load_amv_signals(start, end, buy_th, sell_th, entry_window="123",
-                     exit_rule="drop"):
+def load_amv_signals(start, end, buy_th, sell_th, entry_window="12",
+                     exit_rule="drop", calendar=None, input_root=None):
     """机械信号（干净 CSV 口径）。只用标签恰为真实交易日的行；
     累加和分量要求交易日历相邻，否则该分量作废。
     entry_window: "12"=max(当日,2日和)；"123"=max(当日,2日和,3日和)
     exit_rule: "drop"=当日<sell_th；"ma10"=0AMV收盘跌破MA10；"both"=任一触发。"""
-    cal = trading_calendar()
+    cal = trading_calendar() if calendar is None else calendar
     cal_pos = {d: i for i, d in enumerate(cal)}
-    amv = pd.read_csv(os.path.join(HERE, "0amv_day.csv"))
+    amv = pd.read_csv(os.path.join(HERE if input_root is None else input_root, "0amv_day.csv"))
     amv["d"] = (pd.to_datetime(amv["date"], utc=True)
                 .dt.tz_convert("Asia/Shanghai").dt.tz_localize(None))
     amv = amv.set_index("d").sort_index()
-    amv = amv[~amv.index.duplicated(keep="last")]
+    if amv.index.duplicated().any():
+        raise ValueError("Duplicate AMV dates; reconcile the source first")
     amv_close = amv["close"]
-    ma10 = amv_close.rolling(10).mean()
+    ma10 = amv_close.reindex(cal).rolling(10).mean()
 
     rows = []
     for d, row in amv.iterrows():
@@ -111,16 +114,25 @@ def load_amv_signals(start, end, buy_th, sell_th, entry_window="123",
 # ---------------------------------------------------------------- 指标层
 
 class Asset:
-    def __init__(self, code):
+    def __init__(self, code, calendar=None, input_root=None):
         self.code = code
-        self.df = load_kline(code)
+        self.df = load_kline(code, input_root)
         c = self.df["close"]
         self.ma20 = c.rolling(20).mean()
         self.ma60 = c.rolling(60).mean()
-        self.ret20 = c.pct_change(20)
-        self.ret1 = c.pct_change()
+        self.ret20 = c.pct_change(20, fill_method=None)
+        self.ret1 = c.pct_change(fill_method=None)
         self.ma200 = c.rolling(200).mean()
         self.listed_pos = {d: i for i, d in enumerate(self.df.index)}
+        calendar = trading_calendar() if calendar is None else calendar
+        calendar_positions = calendar.get_indexer(self.df.index)
+        runs = np.zeros(len(self.df), dtype=int)
+        for index, calendar_position in enumerate(calendar_positions):
+            runs[index] = (
+                runs[index - 1] + 1 if index and calendar_position >= 0
+                and calendar_position - calendar_positions[index - 1] == 1 else 1
+            )
+        self.contiguous = runs
         # 成交额估算（腾讯量为手）：手×100×收盘价，单位元
         self.amt20 = (self.df["volume"] * 100 * c).rolling(20).mean()
         # Chaikin 资金流代理：CLV = 收盘在当日振幅中的位置 (-1~+1)
@@ -160,6 +172,8 @@ def funnel(d, assets, bench, prev_pick, prev_pick_rs, rs_window, top2_gap,
     for code, a in assets.items():
         p = a.pos(d)
         if p is None or p < min_listed:
+            continue
+        if hasattr(a, "contiguous") and a.contiguous[p] < max(63, rs_window + 1):
             continue
         if min_amt > 0 and (pd.isna(a.amt20.iloc[p]) or a.amt20.iloc[p] < min_amt):
             continue
@@ -225,36 +239,42 @@ def funnel(d, assets, bench, prev_pick, prev_pick_rs, rs_window, top2_gap,
 # ---------------------------------------------------------------- 上下文（可复用）
 
 class Context:
-    def __init__(self, start, end, benchmark="sh000001"):
-        cal = trading_calendar()
+    def __init__(self, start, end, benchmark="sh000001", input_root=None):
+        self.input_root = HERE if input_root is None else input_root
+        cal = load_kline("sh000001", self.input_root).index
+        self.full_calendar = cal
         self.cal = cal[(cal >= pd.Timestamp(start)) & (cal <= pd.Timestamp(end))]
-        self.bench_map = {b: Asset(b) for b in ("sh000001", "sh000985")}
-        self.defense = Asset(DEFENSE)
-        self.defense_px = Asset(DEFENSE_PROXY)
-        self.cash = Asset(CASH_ASSET)
-        uni = pd.read_csv(os.path.join(HERE, "data", "etf_universe.csv"))
+        self.bench_map = {b: Asset(b, cal, self.input_root) for b in ("sh000001", "sh000985")}
+        self.defense = Asset(DEFENSE, cal, self.input_root)
+        self.defense_px = Asset(DEFENSE_PROXY, cal, self.input_root)
+        self.cash = Asset(CASH_ASSET, cal, self.input_root)
+        uni = pd.read_csv(os.path.join(self.input_root, "data", "etf_universe.csv"))
         codes = uni.loc[uni.cat == "行业主题", "code"].tolist()
         self.assets = {}
         for c in codes:
-            fp = os.path.join(KLINE, f"{c}.csv")
+            fp = os.path.join(self.input_root, "data", "kline", f"{c}.csv")
             if os.path.exists(fp) and os.path.getsize(fp) > 100:
-                self.assets[c] = Asset(c)
+                self.assets[c] = Asset(c, cal, self.input_root)
         self.n_universe = len(codes)
         self.start, self.end = start, end
 
 
 # ---------------------------------------------------------------- 回测主循环
 
-def run_bt(ctx: Context, args, collect=False):
+def run_bt(ctx: Context, args, collect=False, signal_filter=None, selector=None):
     cal, bench = ctx.cal, ctx.bench_map[args.benchmark]
+    if cal.empty:
+        raise ValueError("No trading dates in requested interval")
     defense, defense_px, cash = ctx.defense, ctx.defense_px, ctx.cash
     assets = ctx.assets
     if getattr(args, "signals", "ledger") == "ledger":
-        sig = load_ledger_signals(ctx.start, ctx.end)
+        sig = load_ledger_signals(ctx.start, ctx.end, getattr(ctx, "input_root", None))
     else:
         sig = load_amv_signals(ctx.start, ctx.end, args.buy_th, args.sell_th,
                                getattr(args, "entry_window", "12"),
-                               getattr(args, "exit_rule", "drop"))
+                               getattr(args, "exit_rule", "drop"),
+                               getattr(ctx, "full_calendar", None),
+                               getattr(ctx, "input_root", None))
 
     def px(a: Asset, d, kind):
         if a.has(d):
@@ -277,43 +297,53 @@ def run_bt(ctx: Context, args, collect=False):
     pending = None      # (action, targets, rs_map)
     nav_rows, seg_rows = [], []
     cur_seg = None
-    last_prices = {}
+    transactions = []
+    valuation_warnings = []
+    return_events = []
+    cursor_value = 1.0
+    raw_state = "D"
     seg_day = 0
 
-    def mark(d):
-        v = 0.0
-        for code, sh in pos.items():
-            p = px(assets.get(code) or (defense if code == DEFENSE else
-                 cash if code == CASH_ASSET else defense_px), d, "close")
-            if np.isnan(p):
-                p = last_prices.get(code, np.nan)
-            if np.isnan(p):
-                raise ValueError(f"{code} 在 {d.date()} 无价")
-            v += sh * p
-        return v
+    def asset_for(code):
+        return assets.get(code) or (defense if code == DEFENSE else
+                                    cash if code == CASH_ASSET else defense_px)
+
+    def exposure():
+        return "attack" if any(code not in {DEFENSE, DEFENSE_PROXY, CASH_ASSET} for code in pos) else "defense"
+
+    def record_factor(d, value, leg):
+        nonlocal cursor_value
+        if cursor_value <= 0 or value <= 0:
+            raise ValueError("Invalid return attribution boundary")
+        return_events.append({"date": str(d.date()), "leg": leg, "factor": float(value / cursor_value)})
+        cursor_value = value
+
+    def mark(d, kind="close", valuation=False):
+        prices = {code: px(asset_for(code), d, kind) for code in pos}
+        for code, price in prices.items():
+            if not np.isfinite(price) and valuation and getattr(args, "valuation_policy", "strict") == "previous-close":
+                previous = asset_for(code).df.loc[:d, "close"].dropna()
+                if previous.empty:
+                    raise ValueError(f"No previous valuation: {code} {d}")
+                prices[code] = float(previous.iloc[-1])
+                valuation_warnings.append({"date": str(d.date()), "code": code,
+                                           "policy": "previous-close", "price": prices[code]})
+        return portfolio_value(pos, 0.0, prices) if pos else nav
 
     def do_trade(d, targets, kind):
         """按 targets {code: weight} 全量换仓，扣双边成本。"""
         nonlocal nav, pos
         first = len(pos) == 0
-        v = nav if first else mark(d)
-        turnover_in = sum(targets.values())
-        sell_leg = 0.0 if first else 1.0
-        cost_rate = args.cost * (sell_leg + min(turnover_in, 1.0))
-        v *= (1 - cost_rate)
-        new_pos = {}
-        for code, w in targets.items():
-            a = assets.get(code) or (defense if code == DEFENSE else
-                                     cash if code == CASH_ASSET else defense_px)
-            p = px(a, d, kind)
-            if np.isnan(p):  # 标的数据缺口 → 该腿退守防守资产
-                a2 = defense if defense.has(d) else defense_px
-                p = px(a2, d, kind)
-                code = a2.code
-            new_pos[code] = new_pos.get(code, 0.0) + v * w / p
-            last_prices[code] = p
-        pos = new_pos
-        nav = v
+        prices = {code: px(asset_for(code), d, kind) for code in set(pos) | set(targets)}
+        before = mark(d, kind)
+        record_factor(d, before, exposure())
+        pos, nav, fees, turnover = rebalance(pos, nav if first else 0.0, targets, prices, args.cost)
+        record_factor(d, nav, "cost")
+        transactions.append({
+            "date": str(d.date()), "kind": kind, "before": before,
+            "after": nav, "fees": fees, "turnover": turnover, "targets": targets,
+        })
+        return before
 
     for d in cal:
         if d == cal[0] and not pos:
@@ -325,25 +355,28 @@ def run_bt(ctx: Context, args, collect=False):
             pending = None
             if act == "enter":
                 if targets:
-                    do_trade(d, dict(targets), args.exec_price)
+                    entry_value = do_trade(d, dict(targets), args.exec_price)
                     cur_seg = {"entry_sig": sig_d.date(), "entry": d.date(),
                                "picks": [(c, w, rs_map.get(c)) for c, w in targets],
-                               "entry_nav": nav}
+                               "entry_nav": entry_value}
                     prev_pick = targets[0][0]
                     prev_pick_rs = rs_map.get(prev_pick)
                     state = "A"
                     seg_day = 0
                 else:  # 空主线：持有防守资产
                     da = defense_asset_at(d)
+                    entry_value = mark(d, args.exec_price)
                     if set(pos) != {da.code}:
                         do_trade(d, {da.code: 1.0}, args.exec_price)
                     cur_seg = {"entry_sig": sig_d.date(), "entry": d.date(),
-                               "picks": [], "entry_nav": nav, "empty_mainline": True}
+                               "picks": [], "entry_nav": entry_value, "empty_mainline": True}
                     state = "A"
             elif act == "exit":
                 da = defense_asset_at(d)
                 if set(pos) != {da.code}:
                     do_trade(d, {da.code: 1.0}, args.exec_price)
+                else:
+                    nav = mark(d, args.exec_price)
                 if cur_seg is not None:
                     cur_seg["exit_sig"] = sig_d.date()
                     cur_seg["exit"] = d.date()
@@ -396,8 +429,15 @@ def run_bt(ctx: Context, args, collect=False):
         # 收盘后判定信号
         if d in sig.index:
             row = sig.loc[d]
-            if state == "D" and row["buy"]:
-                targets = funnel(d, assets, bench, prev_pick, prev_pick_rs,
+            entry_event = raw_state == "D" and row["buy"]
+            exit_event = raw_state == "A" and row["sell"]
+            if row["sell"]:
+                raw_state = "D"
+            elif entry_event:
+                raw_state = "A"
+            if state == "D" and entry_event and (signal_filter is None or signal_filter(d)):
+                targets = selector(d, prev_pick, prev_pick_rs) if selector else funnel(
+                                 d, assets, bench, prev_pick, prev_pick_rs,
                                  args.rs_window, args.top2_gap,
                                  min_amt=getattr(args, "min_amt", 0.0),
                                  rs_blend=getattr(args, "rs_blend", False),
@@ -414,12 +454,13 @@ def run_bt(ctx: Context, args, collect=False):
                     rs_map[code] = r20 - br
                 pending = ("enter", targets, rs_map)
                 sig_d = d
-            elif state == "A" and row["sell"]:
+            elif state == "A" and exit_event:
                 pending = ("exit", None, None)
                 sig_d = d
 
-        nav = mark(d)
-        nav_rows.append((d, nav, state))
+        nav = mark(d, valuation=True)
+        record_factor(d, nav, exposure())
+        nav_rows.append((d, nav, "A" if exposure() == "attack" else "D"))
 
     if cur_seg is not None:
         cur_seg["exit"] = cal[-1].date()
@@ -430,6 +471,9 @@ def run_bt(ctx: Context, args, collect=False):
 
     if collect:
         nv = pd.DataFrame(nav_rows, columns=["date", "nav", "state"]).set_index("date")
+        nv.attrs["transactions"] = transactions
+        nv.attrs["valuation_warnings"] = valuation_warnings
+        nv.attrs["return_events"] = return_events
         return nv, pd.DataFrame(seg_rows)
     report(nav_rows, seg_rows, cal, defense, defense_px, args)
 
@@ -442,35 +486,34 @@ def report(nav_rows, seg_rows, cal, defense, defense_px, args):
     seg = pd.DataFrame(seg_rows)
     seg.to_csv(os.path.join(OUT, "segments.csv"), index=False)
 
-    total = nv.nav.iloc[-1] - 1
-    yrs = (nv.index[-1] - nv.index[0]).days / 365.25
-    cagr = nv.nav.iloc[-1] ** (1 / yrs) - 1
-    mdd = (nv.nav / nv.nav.cummax() - 1).min()
-    calmar = cagr / abs(mdd) if mdd < 0 else np.nan
+    stats = equity_stats(nv.nav)
+    total, cagr, mdd = stats["total"], stats["cagr"], stats["mdd"]
+    calmar = stats["calmar"] if stats["calmar"] is not None else np.nan
     atk = nv[nv.state == "A"]
     share = len(atk) / len(nv)
-    wins = seg[seg.ret > 0].shape[0] if len(seg) else 0
+    closed = seg[~seg.get("open_end", pd.Series(False, index=seg.index)).fillna(False).astype(bool)]
+    closed = closed[~closed.get("empty_mainline", pd.Series(False, index=closed.index)).fillna(False).astype(bool)]
+    wins = closed[closed.ret > 0].shape[0] if len(closed) else 0
 
     print("\n===== 回测结果 =====")
     print(f"区间 {nv.index[0].date()} ~ {nv.index[-1].date()}")
     print(f"累计 {total:+.1%}  年化 {cagr:.1%}  最大回撤 {mdd:.1%}  Calmar {calmar:.2f}")
-    print(f"进攻时间占比 {share:.0%}  进攻段 {len(seg)} 胜率 "
-          f"{wins}/{len(seg)} = {(wins/len(seg) if len(seg) else 0):.0%}")
+    print(f"进攻时间占比 {share:.0%}  已结算进攻段 {len(closed)} 胜率 "
+          f"{wins}/{len(closed)} = {(wins/len(closed) if len(closed) else 0):.0%}")
     print("\n分年收益:")
-    for y in range(nv.index[0].year, nv.index[-1].year + 1):
-        w = nv[nv.index.year == y]
-        if len(w) > 5:
-            print(f"  {y}: {w.nav.iloc[-1]/w.nav.iloc[0]-1:+.1%}")
+    for year, value in stats["yearly"].items():
+        print(f"  {year}: {value:+.1%}")
 
     tag = f"exec={args.exec_price} cost={args.cost} rs={args.rs_window} " \
           f"buy={args.buy_th} sell={args.sell_th} overlay={args.defense_overlay}"
     with open(os.path.join(OUT, "summary.json"), "w", encoding="utf-8") as f:
         json.dump({"config": tag, "total": total, "cagr": cagr, "mdd": mdd,
                    "calmar": calmar, "attack_share": share,
-                   "n_segments": len(seg)}, f, ensure_ascii=False, indent=1)
+                   "n_segments": len(closed), "yearly": stats["yearly"]},
+                  f, ensure_ascii=False, indent=1)
     print(f"\n已输出 outputs/equity_curve.csv, segments.csv, summary.json")
     print(f"配置: {tag}")
-    src = "台账" if getattr(args, "signals", "ledger") == "ledger" else "CSV修复版(暂定)"
+    src = "台账" if getattr(args, "signals", "ledger") == "ledger" else "重整理CSV机械信号"
     print(f"声明: 宇宙为当前在册ETF(有幸存者偏差)；信号源={src}")
 
 
@@ -496,6 +539,7 @@ def main():
     p.add_argument("--spike-filter", action="store_true", help="剔除脉冲式上涨候选")
     p.add_argument("--topn", choices=["auto", "2", "3"], default="auto")
     p.add_argument("--rank-by", choices=["rs", "mf1", "mf20"], default="rs")
+    p.add_argument("--valuation-policy", choices=["strict", "previous-close"], default="strict")
     args = p.parse_args()
     ctx = Context(args.start, args.end, args.benchmark)
     print(f"宇宙加载 {len(ctx.assets)} 只有效（清单 {ctx.n_universe} 只）")

@@ -17,46 +17,20 @@ sys.stdout.reconfigure(encoding="utf-8")
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import bt
+from accounting import equity_stats
 from run_experiments import BASE, evaluate
 
 COMBOS = [("1-2日", "12"), ("1-3日", "123")]
 EXITS = [("-2.3%", "drop"), ("跌破MA10", "ma10")]
 
 
-def gen_signals(start, end, buy_th, sell_th, ew, er):
+def gen_signals(start, end, buy_th, sell_th, ew, er, input_root=None):
     """自包含信号生成（用新浪长日历，支持 2012 起）。"""
-    cal = pd.read_csv(os.path.join(HERE, "data", "kline",
+    root = HERE if input_root is None else input_root
+    cal = pd.read_csv(os.path.join(root, "data", "kline",
                                    "sh000001_sina_long.csv"))["date"]
-    cal = pd.to_datetime(cal).tolist()
-    cal_pos = {d: i for i, d in enumerate(cal)}
-    amv = pd.read_csv(os.path.join(HERE, "0amv_day.csv"))
-    amv["d"] = (pd.to_datetime(amv["date"], utc=True)
-                .dt.tz_convert("Asia/Shanghai").dt.tz_localize(None))
-    amv = amv.set_index("d").sort_index()
-    amv = amv[~amv.index.duplicated(keep="last")]
-    ma10 = amv["close"].rolling(10).mean()
-    r = amv["change_pct"] / 100.0
-    ks = (1,) if ew == "12" else (1, 2)
-    out = []
-    idx = amv.index.tolist()
-    for i, d in enumerate(idx):
-        if d not in cal_pos or pd.isna(r.iloc[i]):
-            continue
-        if d < pd.Timestamp(start) or d > pd.Timestamp(end):
-            continue
-        comps = [r.iloc[i]]
-        for k in ks:
-            if i - k >= 0 and cal_pos[d] - cal_pos[idx[i - k]] == k:
-                comps.append(sum(r.iloc[i - j] for j in range(0, k + 1)))
-        b = max(comps) > buy_th
-        if er == "ma10":
-            s = bool(pd.notna(ma10.iloc[i]) and amv["close"].iloc[i] < ma10.iloc[i])
-        else:
-            s = r.iloc[i] < sell_th
-        if b and s:
-            b = False
-        out.append((d, b, s))
-    return pd.DataFrame(out, columns=["date", "buy", "sell"]).set_index("date")
+    return bt.load_amv_signals(start, end, buy_th, sell_th, ew, er,
+                               pd.DatetimeIndex(pd.to_datetime(cal)), root)
 
 
 def timing_bt(sig, px, start, end):
@@ -66,20 +40,24 @@ def timing_bt(sig, px, start, end):
     segs, cur = [], None
     cash_daily = (1.02) ** (1 / 244) - 1
     nav_series = []
-    for d in days:
+    returns = px["close"].pct_change(fill_method=None)
+    for index, d in enumerate(days):
+        if index:
+            ret = returns.loc[d]
+            if not np.isfinite(ret):
+                raise ValueError(f"Missing index return: {d}")
+            nav *= (1 + ret) if state == "A" else (1 + cash_daily)
         if pending == "enter":
-            nav *= 1 - 0.002
             cur = nav
+            nav /= 1 + 0.001
             state = "A"
             pending = None
         elif pending == "exit":
-            nav *= 1 - 0.002
+            nav *= 1 - 0.001
             segs.append(nav / cur - 1)
             cur = None
             state = "D"
             pending = None
-        ret = px["close"].pct_change().get(d, 0.0)
-        nav *= (1 + ret) if state == "A" else (1 + cash_daily)
         nav_series.append((d, nav))
         if d in sig.index:
             row = sig.loc[d]
@@ -88,11 +66,10 @@ def timing_bt(sig, px, start, end):
             elif state == "A" and row["sell"]:
                 pending = "exit"
     nv = pd.Series(dict(nav_series)).sort_index()
-    yrs = (nv.index[-1] - nv.index[0]).days / 365.25
-    mdd = (nv / nv.cummax() - 1).min()
+    stats = equity_stats(nv)
     wins = sum(1 for x in segs if x > 0)
-    return {"累计": nv.iloc[-1] - 1, "年化": nv.iloc[-1] ** (1 / yrs) - 1,
-            "MDD": mdd, "段数": len(segs), "胜率": wins / len(segs) if segs else np.nan}
+    return {"累计": stats["total"], "年化": stats["cagr"],
+            "MDD": stats["mdd"], "段数": len(segs), "胜率": wins / len(segs) if segs else np.nan}
 
 
 def main():
@@ -106,11 +83,12 @@ def main():
             rows.append(row)
             print("done", ename, xname, flush=True)
     df = pd.DataFrame(rows)
-    for c in ["累计", "年化", "回撤", "样本内年化", "样本外年化", "样本外回撤", "胜率"]:
+    for c in ["累计", "年化", "回撤", "历史开发段年化", "历史验证段年化", "历史验证段回撤", "胜率"]:
         df[c] = (df[c] * 100).round(1)
     df["Calmar"] = df["Calmar"].round(2)
-    print(df[["变体", "累计", "年化", "回撤", "Calmar", "样本内年化",
-              "样本外年化", "进攻段", "胜率"]].to_string(index=False))
+    print(df[["变体", "累计", "年化", "回撤", "Calmar", "历史开发段年化",
+              "历史验证段年化", "进攻段", "胜率"]].to_string(index=False))
+    print("所有既有时期已经查看；不是未见样本外证据。")
 
     print("\n== B: 信号层单测（载体=上证指数，防守=2%现金）==")
     px = pd.read_csv(os.path.join(HERE, "data", "kline", "sh000001_sina_long.csv"))

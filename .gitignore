@@ -3,3 +3,8 @@ data/raw/
 outputs/
 __pycache__/
 data/fetch_failures.txt
+.venv/
+*.pyc
+.env
+.env.*
+!.env.example

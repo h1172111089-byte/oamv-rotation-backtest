@@ -28,7 +28,7 @@ for tag, patch in variants:
     print("done", tag, flush=True)
 import pandas as pd
 df = pd.DataFrame(rows)
-for c in ["累计", "年化", "回撤", "样本内年化", "样本外年化", "样本外回撤", "胜率"]:
+for c in ["累计", "年化", "回撤", "历史开发段年化", "历史验证段年化", "历史验证段回撤", "胜率"]:
     df[c] = (df[c] * 100).round(1)
 df["Calmar"] = df["Calmar"].round(2)
 print(df.to_string(index=False))

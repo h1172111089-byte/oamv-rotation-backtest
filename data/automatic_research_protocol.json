@@ -1,0 +1,33 @@
+{
+  "registered_at": "2026-10-14",
+  "purpose": "离线研究；不自动上线、不实盘下单",
+  "objective": "净总收益优先；历史最大回撤容忍度约30%",
+  "signals": {"entry": "max(r1,r1+r_previous)>0.04", "exit": "r1<-0.023", "priority": "sell"},
+  "baseline": {"execution": "T+1_close", "ranking": "RS20", "allocation": "existing_auto", "defense": "512890; before_listing=510880"},
+  "fixed_variants": [
+    "baseline",
+    "open_control",
+    "amv_MA20_slope_positive",
+    "correlation_cluster_breadth_gt_50pct",
+    "RS20_percentile_persistence_5days",
+    "correlation_cluster_median_RS20",
+    "correlation_cluster_median_persistence"
+  ],
+  "feature_windows": {"trend": 20, "relative_strength": 20, "persistence": 5, "correlation": 60, "correlation_threshold": 0.9},
+  "costs": [0.001, 0.0015, 0.002],
+  "historical_validation": "2024-2026已看过，不是真正未见样本外",
+  "promotion_gate": {
+    "historical_mdd": "abs(MDD)<=0.30; near-threshold means no guaranteed compliance",
+    "net_return": "全期与2024以后均优于同成本基线",
+    "winner_dependence": "移除基线最大三个已结算窗口后仍优于对应基线，仅诊断",
+    "data_quality": "缺价/估值假设未解决不得上线",
+    "future_validation": "需要自2026-10-14登记后前瞻验证，无固定未来收益预测"
+  },
+  "limitations": [
+    "相关簇不是实际行业成分股",
+    "当前基金名称和存续清单非历史point-in-time清单",
+    "缺乏历史成分股、基金份额、申赎、估值和公告发布时间，本轮不测试",
+    "ETF前复权行情不是实盘报价或现金分红账",
+    "512890在2021-10-22缺价，previous-close为显式未核实估值假设"
+  ]
+}
