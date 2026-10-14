@@ -61,10 +61,12 @@ def trading_calendar():
     return load_kline("sh000001").index
 
 
-def load_amv_signals(start, end, buy_th, sell_th):
-    """保守修复版信号：只用标签恰为真实交易日的行；
-    2日和要求交易日历相邻，否则该分量作废（不参与取max）。
-    标准买入窗口 = 1-2日累加>阈值（2026-10-13 起，1-3日窗口被证伪弃用）。"""
+def load_amv_signals(start, end, buy_th, sell_th, entry_window="123",
+                     exit_rule="drop"):
+    """机械信号（干净 CSV 口径）。只用标签恰为真实交易日的行；
+    累加和分量要求交易日历相邻，否则该分量作废。
+    entry_window: "12"=max(当日,2日和)；"123"=max(当日,2日和,3日和)
+    exit_rule: "drop"=当日<sell_th；"ma10"=0AMV收盘跌破MA10；"both"=任一触发。"""
     cal = trading_calendar()
     cal_pos = {d: i for i, d in enumerate(cal)}
     amv = pd.read_csv(os.path.join(HERE, "0amv_day.csv"))
@@ -72,9 +74,10 @@ def load_amv_signals(start, end, buy_th, sell_th):
                 .dt.tz_convert("Asia/Shanghai").dt.tz_localize(None))
     amv = amv.set_index("d").sort_index()
     amv = amv[~amv.index.duplicated(keep="last")]
+    amv_close = amv["close"]
+    ma10 = amv_close.rolling(10).mean()
 
     rows = []
-    prev = None
     for d, row in amv.iterrows():
         if d not in cal_pos:
             continue
@@ -85,13 +88,20 @@ def load_amv_signals(start, end, buy_th, sell_th):
         if pd.isna(r) or d < pd.Timestamp(start) or d > pd.Timestamp(end):
             continue
         comps = [r]
-        for k in (1,):
+        ks = (1,) if entry_window == "12" else (1, 2)
+        for k in ks:
             if (i - k >= 0
                     and cal_pos[d] - cal_pos[rows[i - k][0]] == k
                     and not pd.isna(rows[i - k][1])):
                 comps.append(sum(rows[i - j][1] for j in range(0, k + 1)))
         b = max(comps) > buy_th
-        s = r < sell_th
+        if exit_rule == "ma10":
+            s = bool(pd.notna(ma10.get(d)) and amv_close.get(d) < ma10.get(d))
+        elif exit_rule == "both":
+            s = bool((r < sell_th) or (pd.notna(ma10.get(d))
+                                       and amv_close.get(d) < ma10.get(d)))
+        else:
+            s = r < sell_th
         if b and s:
             b = False
         sig.append((d, b, s))
@@ -242,7 +252,9 @@ def run_bt(ctx: Context, args, collect=False):
     if getattr(args, "signals", "ledger") == "ledger":
         sig = load_ledger_signals(ctx.start, ctx.end)
     else:
-        sig = load_amv_signals(ctx.start, ctx.end, args.buy_th, args.sell_th)
+        sig = load_amv_signals(ctx.start, ctx.end, args.buy_th, args.sell_th,
+                               getattr(args, "entry_window", "12"),
+                               getattr(args, "exit_rule", "drop"))
 
     def px(a: Asset, d, kind):
         if a.has(d):
@@ -475,6 +487,8 @@ def main():
     p.add_argument("--benchmark", default="sh000001")
     p.add_argument("--defense-overlay", choices=["none", "ma200"], default="none")
     p.add_argument("--signals", choices=["ledger", "csv"], default="ledger")
+    p.add_argument("--entry-window", choices=["12", "123"], default="12")
+    p.add_argument("--exit-rule", choices=["drop", "ma10", "both"], default="drop")
     p.add_argument("--min-amt", type=float, default=0.0,
                    help="20日均成交额下限（元），0=不过滤")
     p.add_argument("--rerank5", type=int, default=0, help="进攻态每5日重排换仓")
